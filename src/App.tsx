@@ -1,14 +1,19 @@
 import React, { useMemo, useState, useRef, useEffect } from 'react'
 import { useAppState } from './hooks/useAppState'
-import { scheduleAll } from './utils/scheduling'
+import { scheduleAll, dateToSprint, SPRINT_STARTS } from './utils/scheduling'
 import ProjectList from './components/ProjectList'
 import { DevGanttChart } from './components/DevGanttChart'
 import { ProjectEditor } from './components/ProjectEditor'
 import { DevMappingModal } from './components/DevMappingModal'
 import { AtRiskModal } from './components/AtRiskModal'
+import { ScenarioPanel, DEFAULT_SCENARIO } from './components/ScenarioPanel'
+import type { ScenarioConfig } from './components/ScenarioPanel'
+import type { Dev, TeamType, OwnerType } from './types'
+import { generateCSV } from './utils/exportCsv'
 
 const STATUSES_OPTS = ['WIP', 'QA', 'In Design', 'Todo', 'Completed', 'Done', 'Stopped', 'Blocked']
 const PRIORITIES_OPTS = ['p0', 'p1', 'p2']
+
 
 function MultiSelect({ label, options, value, onChange }: {
   label: string
@@ -69,6 +74,7 @@ function MultiSelect({ label, options, value, onChange }: {
 export default function App() {
   const { state, dispatch } = useAppState()
   const [showAtRisk, setShowAtRisk] = useState(false)
+  const [scenario, setScenario] = useState<ScenarioConfig>(DEFAULT_SCENARIO)
 
   const PROJECT_INDEX = useMemo(
     () => Object.fromEntries(state.projects.map((p, i) => [p.id, i])),
@@ -80,16 +86,68 @@ export default function App() {
     [state.devList, state.devOwnerMappings],
   )
 
+  // ── Scenario: ticket date shift ───────────────────────────────────────────
+  const simulatedProjects = useMemo(() => {
+    const { active, scope, sprints } = scenario.ticketShift
+    if (!active) return state.projects
+    return state.projects.map(p => {
+      const sp = dateToSprint(p.ticketReadyDate)
+      if (scope === 'late' && sp < 5) return p
+      if (sp <= 3) return p
+      const newSp = Math.max(3, sp - sprints)
+      if (newSp === sp) return p
+      return { ...p, ticketReadyDate: new Date(SPRINT_STARTS[newSp]).toISOString().slice(0, 10) }
+    })
+  }, [state.projects, scenario.ticketShift])
+
+  // ── Scenario: extra devs ──────────────────────────────────────────────────
+  const simulatedDevs = useMemo((): Dev[] => {
+    const { active, devs: extraList } = scenario.extraDevs
+    if (!active || extraList.length === 0) return devs
+    const skillCounts: Record<string, number> = {}
+    const extras: Dev[] = extraList.map(({ skill, capacity }) => {
+      skillCounts[skill] = (skillCounts[skill] ?? 0) + 1
+      return {
+        name: `+${skill}${skillCounts[skill]}`,
+        team: skill as TeamType,
+        totalSprints: capacity * 36 / 5,  // perSprintCapacity(totalSprints) = capacity
+        owners: state.ownerList as OwnerType[],
+      }
+    })
+    return [...devs, ...extras]
+  }, [devs, scenario.extraDevs, state.ownerList])
+
+  const simulatedOverrides = useMemo(() => {
+    const { active, devs: extraList } = scenario.extraDevs
+    if (!active || extraList.length === 0) return state.devSprintOverrides
+    const overrides = { ...state.devSprintOverrides }
+    const skillCounts: Record<string, number> = {}
+    extraList.forEach(({ skill, capacity, fromSprint }) => {
+      skillCounts[skill] = (skillCounts[skill] ?? 0) + 1
+      const name = `+${skill}${skillCounts[skill]}`
+      // 4.5 = second half of S4 (half capacity in S4, full from S5)
+      // 5   = available from S5 (S3/S4 = 0)
+      // 6   = available from S6 (S3/S4/S5 = 0)
+      const sprintOverride: Record<number, number> =
+        fromSprint === 4.5 ? { 3: 0, 4: capacity / 2 } :
+        fromSprint === 5   ? { 3: 0, 4: 0 } :
+                             { 3: 0, 4: 0, 5: 0 }
+      overrides[name] = sprintOverride
+    })
+    return overrides
+  }, [state.devSprintOverrides, scenario.extraDevs])
+
+  // ── Scheduler ─────────────────────────────────────────────────────────────
   const scheduleResult = useMemo(
     () => scheduleAll(
-      state.projects,
-      devs,
+      simulatedProjects,
+      simulatedDevs,
       state.devAssignments,
       state.devOwnerMappings,
-      state.devSprintOverrides,
+      simulatedOverrides,
       state.bePreworkPct,
     ),
-    [state.projects, devs, state.devAssignments, state.devOwnerMappings, state.devSprintOverrides, state.bePreworkPct],
+    [simulatedProjects, simulatedDevs, state.devAssignments, state.devOwnerMappings, simulatedOverrides, state.bePreworkPct],
   )
 
   const selectedProject = state.selectedProjectId
@@ -143,11 +201,26 @@ export default function App() {
               ⚠ {atRiskCount} at risk
             </button>
           )}
+          <ScenarioPanel scenario={scenario} onChange={setScenario} />
           <button onClick={() => dispatch({ type: 'TOGGLE_DEV_MAPPING' })}
             className="text-xs px-3 py-1 rounded border border-slate-600 text-slate-300 hover:border-slate-400 transition-colors">
             Dev Settings
           </button>
-          {/* Export state */}
+          <button
+            onClick={() => {
+              const csv = generateCSV(simulatedProjects, scheduleResult)
+              const blob = new Blob([csv], { type: 'text/csv' })
+              const url = URL.createObjectURL(blob)
+              const a = document.createElement('a')
+              a.href = url
+              a.download = `ond26-delivery-${new Date().toISOString().slice(0,10)}.csv`
+              a.click()
+              URL.revokeObjectURL(url)
+            }}
+            className="text-xs px-3 py-1 rounded border border-emerald-700 text-emerald-400 hover:border-emerald-500 hover:text-emerald-300 transition-colors"
+            title="Export delivery plan as CSV">
+            Export CSV
+          </button>
           <button
             onClick={() => {
               const raw = localStorage.getItem('gantt_state_v4')
@@ -164,7 +237,6 @@ export default function App() {
             title="Export current state as JSON">
             Export
           </button>
-          {/* Import state */}
           <label
             className="text-xs px-3 py-1 rounded border border-slate-600 text-slate-400 hover:border-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
             title="Import a previously exported state JSON">
@@ -195,10 +267,9 @@ export default function App() {
       {/* ── Main 3-panel layout ── */}
       <div className="flex flex-1 overflow-hidden">
 
-        {/* Left: Project list */}
         <div className="w-72 flex-shrink-0 border-r border-slate-700 overflow-y-auto">
           <ProjectList
-            projects={state.projects}
+            projects={simulatedProjects}
             scheduleResult={scheduleResult}
             projectIndex={PROJECT_INDEX}
             state={state}
@@ -206,11 +277,10 @@ export default function App() {
           />
         </div>
 
-        {/* Center: Dev-centric Gantt */}
         <div className="flex-1 overflow-auto">
           <DevGanttChart
-            projects={state.projects}
-            devs={devs}
+            projects={simulatedProjects}
+            devs={simulatedDevs}
             scheduleResult={scheduleResult}
             projectIndex={PROJECT_INDEX}
             state={state}
@@ -218,7 +288,6 @@ export default function App() {
           />
         </div>
 
-        {/* Right: Project editor (slides in when project selected) */}
         {selectedProject && (
           <div className="w-72 flex-shrink-0 border-l border-slate-700 bg-slate-800/80 overflow-hidden">
             <ProjectEditor
@@ -231,17 +300,15 @@ export default function App() {
         )}
       </div>
 
-      {/* Dev settings modal */}
       {state.showDevMapping && (
         <DevMappingModal state={state} dispatch={dispatch} />
       )}
 
-      {/* At Risk modal */}
       {showAtRisk && (
         <AtRiskModal
-          projects={state.projects}
+          projects={simulatedProjects}
           scheduleResult={scheduleResult}
-          devList={state.devList}
+          devList={simulatedDevs}
           onClose={() => setShowAtRisk(false)}
         />
       )}

@@ -7,7 +7,7 @@ export const PLANNING_SPRINTS = [3, 4, 5, 6] as const
 export type SprintNum = 3 | 4 | 5 | 6
 
 // ── Sprint calendar ──────────────────────────────────────────────────────────
-const SPRINT_STARTS: Record<number, number> = {
+export const SPRINT_STARTS: Record<number, number> = {
   3: new Date('2026-11-09').getTime(),
   4: new Date('2026-11-23').getTime(),
   5: new Date('2026-12-07').getTime(),
